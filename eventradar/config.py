@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     max_ai_calls_per_day: int = Field(default=300, ge=1)
     max_posts_per_cycle: int = Field(default=100, ge=1, le=1000)
     max_digest_items: int = Field(default=20, ge=1, le=50)
-    google_routes_api_key: SecretStr = SecretStr("")
 
     @field_validator("default_timezone", "source_timezone")
     @classmethod

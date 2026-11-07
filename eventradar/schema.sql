@@ -81,4 +81,9 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS posts_pending ON posts(retry_after, id);
 CREATE INDEX IF NOT EXISTS subscriptions_channel ON subscriptions(channel_id);
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(sent, retry_after);
-PRAGMA user_version=1;
+CREATE TABLE IF NOT EXISTS travel_estimates (
+ user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ fingerprint TEXT NOT NULL, payload TEXT NOT NULL, expires_at REAL NOT NULL,
+ PRIMARY KEY(user_id, fingerprint)
+);
+PRAGMA user_version=2;

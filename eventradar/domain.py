@@ -54,6 +54,25 @@ class Decision(BaseModel):
     reason: str = Field(max_length=450)
 
 
+class TravelEstimate(BaseModel):
+    min_minutes: int | None = Field(ge=1, le=1440)
+    max_minutes: int | None = Field(ge=1, le=1440)
+    min_transfers: int | None = Field(ge=0, le=12)
+    max_transfers: int | None = Field(ge=0, le=12)
+    explanation: str = Field(min_length=1, max_length=350)
+
+    @model_validator(mode="after")
+    def valid_ranges(self) -> "TravelEstimate":
+        for minimum, maximum in ((self.min_minutes, self.max_minutes), (self.min_transfers, self.max_transfers)):
+            if (minimum is None) != (maximum is None):
+                raise ValueError("Estimate range must have both bounds or neither")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError("Estimate range is reversed")
+        if self.min_minutes is None and self.min_transfers is not None:
+            raise ValueError("Transfers require an estimated journey")
+        return self
+
+
 def fingerprint(*values: object) -> str:
     return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 

@@ -25,7 +25,7 @@ HELP = """EventRadar — ваши каналы и события.
 /schedule 09:00 Europe/Moscow — время отчета и часовой пояс
 /city Москва — город; /region Россия, Москва — регион
 /address адрес — точка отправления; /address clear — удалить
-/routing on или off — согласие передавать адрес Google для расчета дороги
+/routing on или off — приблизительная оценка дороги AI с передачей адреса OpenAI
 /block 3 00:00 00:00 9 5 — занято каждую среду с сентября по май
 Формат: день 1–7, начало, конец, первый месяц, последний месяц.
 Одинаковые часы означают полные сутки; ночные интервалы поддерживаются.
@@ -178,11 +178,8 @@ def create_router(service: Service, reader: Reader) -> Router:
                 if argument not in {"on", "off"}:
                     raise ValueError("Укажите on или off.")
                 field = "routing" if name == "/routing" else "community"
-                if field == "routing" and argument == "on" and not service.routes.key:
-                    await message.answer("Владелец еще не настроил GOOGLE_ROUTES_API_KEY. Ссылки на маршрут доступны без него.")
-                    return
                 await db.execute(f"UPDATE users SET {field}=? WHERE id=?", (int(argument == "on"), uid))
-                await message.answer(("Расчет включен: ваш адрес и место события будут передаваться Google Routes для оценки дороги." if argument == "on" else "Расчет с передачей адреса выключен.") if field == "routing" else "Настройка получения предложений каналов сохранена.")
+                await message.answer(("Оценка дороги включена: ваш адрес и место события будут передаваться OpenAI. AI даст приблизительный диапазон времени и пересадок без карт и расписания транспорта." if argument == "on" else "Оценка дороги AI и передача адреса выключены.") if field == "routing" else "Настройка получения предложений каналов сохранена.")
             elif name == "/block":
                 weekday, start, end, first, last = argument.split()
                 weekday, first, last = int(weekday), int(first), int(last)
@@ -258,9 +255,9 @@ def create_router(service: Service, reader: Reader) -> Router:
                 await db.execute("UPDATE users SET enabled=? WHERE id=?", (int(name == "/resume"), uid))
                 await message.answer("Отчеты включены." if name == "/resume" else "Отчеты выключены. Приглашения от друзей остаются доступны.")
             elif name == "/settings":
-                await message.answer(f"Отчет: {user['report_time']}, {user['timezone']}\nГород: {user['city'] or 'не задан'}\nРегион: {user['region'] or 'не задан'}\nАдрес: {user['address'] or 'не задан'}\nПередача адреса Google: {'да' if user['routing'] else 'нет'}\nПредложения каналов: {'да' if user['community'] else 'нет'}\nОтчеты: {'включены' if user['enabled'] else 'выключены'}")
+                await message.answer(f"Отчет: {user['report_time']}, {user['timezone']}\nГород: {user['city'] or 'не задан'}\nРегион: {user['region'] or 'не задан'}\nАдрес: {user['address'] or 'не задан'}\nОценка дороги AI с передачей адреса OpenAI: {'да' if user['routing'] else 'нет'}\nПредложения каналов: {'да' if user['community'] else 'нет'}\nОтчеты: {'включены' if user['enabled'] else 'выключены'}")
             elif name == "/privacy":
-                await message.answer("На сервере хранятся ваш Telegram ID, имя, интересы, подписки, настройки, адрес, дружба, приглашения и отзывы. Тексты публичных каналов общие. OpenAI получает публикации, ваш промпт, город и регион; домашний адрес и Telegram ID туда не отправляются. Google получает адрес только после /routing on. Отзывы личные до /reviewshare. /delete_me удаляет ваши данные из рабочей базы; уже отправленные сообщения и серверные резервные копии автоматически не удаляются.")
+                await message.answer("На сервере хранятся ваш Telegram ID, имя, интересы, подписки, настройки, адрес, дружба, приглашения и отзывы. Тексты публичных каналов общие. OpenAI получает публикации, ваш промпт, город и регион. Домашний адрес передается OpenAI только для приблизительной оценки дороги после /routing on; Telegram ID в AI-запросы не включается. Карты и расписания транспорта не запрашиваются. Отзывы личные до /reviewshare. /delete_me удаляет ваши данные, включая кеш оценок дороги, из рабочей базы; уже отправленные сообщения и серверные резервные копии автоматически не удаляются.")
             elif name == "/delete_me":
                 await message.answer("Удалить все ваши настройки, подписки, дружбу, приглашения и отзывы из рабочей базы?", reply_markup=keyboard([[("Удалить мои данные", "delete:confirm")]]))
             else:

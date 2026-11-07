@@ -27,7 +27,7 @@ async def main() -> None:
     ai = Intelligence(settings, db)
     bot = Bot(settings.telegram_bot_token.get_secret_value())
     reader = Reader(settings, db, ai)
-    routes = Routes(settings.google_routes_api_key.get_secret_value())
+    routes = Routes(ai, db)
     service = Service(settings, db, ai, bot, routes)
     dispatcher = Dispatcher()
     dispatcher.include_router(create_router(service, reader))
@@ -99,7 +99,6 @@ async def main() -> None:
         await reader.client.disconnect()
         await bot.session.close()
         await ai.client.close()
-        await routes.client.aclose()
 
 
 if __name__ == "__main__":

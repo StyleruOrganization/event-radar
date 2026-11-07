@@ -50,8 +50,11 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.path) as connection:
             version = (await (await connection.execute("PRAGMA user_version")).fetchone())[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError("Database is newer than this application; refuse unsafe downgrade")
+            if version == 1:
+                # Google consent does not authorize sending an address to a different provider.
+                await connection.execute("UPDATE users SET routing=0")
             await connection.executescript(files("eventradar").joinpath("schema.sql").read_text())
 
     async def rows(self, sql: str, parameters: tuple = ()) -> list[dict[str, Any]]:

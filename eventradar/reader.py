@@ -1,13 +1,13 @@
+import asyncio
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, MessageEntityTextUrl, MessageEntityUrl
 
-from eventradar.ai import DailyBudgetExceeded, Intelligence
 from eventradar.config import Settings
 from eventradar.db import Database
 from eventradar.domain import fingerprint
@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 class Reader:
-    def __init__(self, settings: Settings, db: Database, ai: Intelligence):
-        self.settings, self.db, self.ai = settings, db, ai
+    def __init__(self, settings: Settings, db: Database):
+        self.settings, self.db = settings, db
         self.client = TelegramClient(
             StringSession(settings.telegram_reader_session.get_secret_value()),
             settings.telegram_api_id, settings.telegram_api_hash.get_secret_value(),
@@ -39,6 +39,36 @@ class Reader:
             raise ValueError("Поддерживаются только публичные каналы, не группы и личные чаты.")
         return entity.id, entity.title
 
+    async def photo(self, username: str, message_id: int) -> bytes | None:
+        """Read one source illustration, respecting Telegram content protection."""
+        if time.time() < self.cooldown_until:
+            return None
+        maximum = 8 * 1024 * 1024
+        try:
+            async with asyncio.timeout(30):
+                entity = await self.client.get_entity(username)
+                if getattr(entity, "noforwards", False):
+                    return None
+                message = await self.client.get_messages(entity, ids=message_id)
+                if not message or not message.photo or getattr(message, "noforwards", False):
+                    return None
+                size = message.file.size if message.file else None
+                if size is None or size > maximum:
+                    return None
+
+                def enforce_limit(received: int, _total: int) -> None:
+                    if received > maximum:
+                        raise ValueError("Source photo is too large")
+
+                data = await self.client.download_media(message, file=bytes, progress_callback=enforce_limit)
+                return data if isinstance(data, bytes) and len(data) <= maximum else None
+        except FloodWaitError as error:
+            self.cooldown_until = time.time() + error.seconds + 5
+            return None
+        except Exception as error:
+            logger.warning("Source illustration unavailable (%s)", type(error).__name__)
+            return None
+
     async def save(self, channel_id: int, message) -> None:
         if not message.message:
             return
@@ -59,74 +89,37 @@ class Reader:
             (channel_id, message.id, message.date.astimezone(UTC).isoformat(), text, fingerprint(text)),
         )
 
-    async def collect(self) -> None:
+    async def collect(self, since: datetime, until: datetime) -> list[str]:
+        """Load the complete report window. This method never calls AI."""
         if time.time() < self.cooldown_until:
-            return
-        channels = await self.db.rows("SELECT DISTINCT c.* FROM channels c JOIN subscriptions s ON s.channel_id=c.id")
+            return ["Telegram просит подождать перед повторным чтением каналов."]
+        failures: list[str] = []
+        channels = await self.db.rows(
+            "SELECT c.* FROM channels c JOIN subscriptions s ON s.channel_id=c.id WHERE s.user_id=? ORDER BY c.id",
+            (self.settings.owner_telegram_id,),
+        )
         for channel in channels:
             try:
                 entity = await self.client.get_entity(channel["username"])
                 if entity.id != channel["id"]:
                     raise ValueError("Channel username now belongs to another channel")
-                cursor = channel["cursor"]
-                since = datetime.now(UTC) - timedelta(days=self.settings.initial_lookback_days)
-                if not cursor:
-                    # A boundary cursor avoids importing the entire history on first subscription.
-                    async for boundary in self.client.iter_messages(entity, offset_date=since, limit=1):
-                        cursor = boundary.id
-                async for message in self.client.iter_messages(
-                    entity, min_id=cursor, reverse=True, limit=self.settings.max_posts_per_cycle,
-                ):
+                # Telethon paginates all messages; no per-cycle cap may truncate the report.
+                async for message in self.client.iter_messages(entity, offset_date=until, limit=None):
+                    if message.date < since:
+                        break
+                    if message.date >= until:
+                        continue
                     await self.save(channel["id"], message)
-                    cursor = max(cursor, message.id)
-                    await self.db.execute("UPDATE channels SET cursor=? WHERE id=?", (cursor, channel["id"]))
-                # Refresh recent edits and detect deleted recent posts without losing the history cursor.
-                recent = [message async for message in self.client.iter_messages(entity, limit=30)]
-                for message in recent:
-                    if message.id <= cursor and message.date >= since:
-                        await self.save(channel["id"], message)
-                if recent:
-                    low, high = min(m.id for m in recent), max(m.id for m in recent)
-                    existing = {m.id for m in recent}
-                    for post in await self.db.rows(
-                        "SELECT id,message_id FROM posts WHERE channel_id=? AND message_id BETWEEN ? AND ?",
-                        (channel["id"], low, high),
-                    ):
-                        if post["message_id"] not in existing:
-                            await self.db.execute("UPDATE items SET active=0 WHERE post_id=?", (post["id"],))
                 await self.db.execute("UPDATE channels SET error=NULL WHERE id=?", (channel["id"],))
             except FloodWaitError as error:
                 self.cooldown_until = time.time() + error.seconds + 5
-                await self.db.execute("UPDATE channels SET error=? WHERE id=?", (f"Telegram: пауза {error.seconds} с", channel["id"]))
+                detail = f"@{channel['username']}: Telegram просит паузу {error.seconds} с."
+                await self.db.execute("UPDATE channels SET error=? WHERE id=?", (detail, channel["id"]))
+                failures.append(detail)
                 break
             except Exception as error:
                 logger.warning("Channel %s unavailable (%s)", channel["id"], type(error).__name__)
-                await self.db.execute("UPDATE channels SET error=? WHERE id=?", ("Источник временно недоступен", channel["id"]))
-
-    async def extract(self) -> None:
-        pending = await self.db.rows(
-            "SELECT p.* FROM posts p WHERE (processed_hash IS NULL OR processed_hash!=content_hash) "
-            "AND retry_after<=? AND attempts<8 AND EXISTS(SELECT 1 FROM subscriptions s WHERE s.channel_id=p.channel_id) "
-            "ORDER BY p.id LIMIT ?", (time.time(), self.settings.max_posts_per_cycle),
-        )
-        for post in pending:
-            try:
-                result = await self.ai.extract(post["text"], post["published_at"])
-                async with self.db.transaction() as connection:
-                    # A new content version gets new immutable card IDs, preserving invitation history.
-                    await connection.execute("UPDATE items SET active=0 WHERE post_id=?", (post["id"],))
-                    for ordinal, item in enumerate(result.items):
-                        await connection.execute(
-                            "INSERT INTO items(post_id,ordinal,version,payload) VALUES(?,?,?,?) "
-                            "ON CONFLICT(post_id,version,ordinal) DO UPDATE SET active=1",
-                            (post["id"], ordinal, post["content_hash"], item.model_dump_json()),
-                        )
-                    await connection.execute("UPDATE posts SET processed_hash=?,attempts=0 WHERE id=?", (post["content_hash"], post["id"]))
-            except DailyBudgetExceeded:
-                break
-            except Exception as error:
-                logger.warning("Extraction %s failed (%s)", post["id"], type(error).__name__)
-                await self.db.execute(
-                    "UPDATE posts SET attempts=attempts+1,retry_after=? WHERE id=?",
-                    (time.time() + min(21600, 60 * 2 ** post["attempts"]), post["id"]),
-                )
+                detail = f"@{channel['username']}: источник временно недоступен."
+                await self.db.execute("UPDATE channels SET error=? WHERE id=?", (detail, channel["id"]))
+                failures.append(detail)
+        return failures

@@ -45,6 +45,21 @@ if ! docker compose build --pull bot; then
   exit 1
 fi
 
+# The host SSH user cannot read the container-owned OAuth directory (uid 10001).
+# Inspect it as the application user, without printing credentials or using AI.
+docker compose run --rm --no-deps -T bot python - <<'PYTHON'
+import os
+from pathlib import Path
+from eventradar.chatgpt_auth import ChatGPTCredentials
+profile = ChatGPTCredentials(Path(os.environ.get('CHATGPT_AUTH_DIR', '/data/chatgpt'))).profile()
+if not all(profile.get(field) for field in ('client_id', 'subject', 'access_token', 'refresh_token')):
+    raise SystemExit('Import the ChatGPT session before deployment')
+if 'chatgpt.tokens.use.direct' not in profile.get('scopes', []):
+    raise SystemExit('The ChatGPT session has no plan-usage permission')
+if not Path(os.environ.get('DATABASE_PATH', '/data/eventradar.sqlite3')).is_file():
+    raise SystemExit('Import the local database before deployment; refusing an empty first start')
+PYTHON
+
 # Consistent online SQLite backup; never cp a live WAL database.
 if [[ -n "$(docker compose ps -q bot)" ]]; then
   docker compose exec -T bot python - <<'PY'

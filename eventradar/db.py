@@ -1,4 +1,3 @@
-import json
 from contextlib import asynccontextmanager
 from importlib.resources import files
 from pathlib import Path
@@ -50,8 +49,17 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.path) as connection:
             version = (await (await connection.execute("PRAGMA user_version")).fetchone())[0]
-            if version > 2:
+            if version > 5:
                 raise RuntimeError("Database is newer than this application; refuse unsafe downgrade")
+            if 0 < version < 4:
+                columns = {row[1] for row in await (await connection.execute("PRAGMA table_info(users)")).fetchall()}
+                for column in ("last_report_at", "last_report_attempt"):
+                    if column not in columns:
+                        await connection.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+                await connection.execute(
+                    "UPDATE users SET last_report_at=(SELECT MAX(sent_at) FROM deliveries WHERE user_id=users.id) "
+                    "WHERE last_report_at IS NULL"
+                )
             if version == 1:
                 # Google consent does not authorize sending an address to a different provider.
                 await connection.execute("UPDATE users SET routing=0")
@@ -72,12 +80,3 @@ class Database:
             cursor = await connection.execute(sql, parameters)
             return cursor.lastrowid or 0
 
-    async def enqueue(self, recipient: int, text: str, dedupe: str, keyboard: dict | None = None, *, sender: int | None = None) -> None:
-        chunks = message_chunks(text)
-        async with self.transaction() as connection:
-            for index, chunk in enumerate(chunks):
-                markup = json.dumps(keyboard) if keyboard and index == len(chunks) - 1 else None
-                await connection.execute(
-                    "INSERT OR IGNORE INTO outbox(recipient,sender,text,keyboard,dedupe) VALUES(?,?,?,?,?)",
-                    (recipient, sender, chunk, markup, f"{dedupe}:{index}"),
-                )

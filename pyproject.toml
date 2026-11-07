@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "eventradar"
 version = "0.1.0"
-description = "Private Telegram channel digests and event invitations"
-requires-python = ">=3.12"
+description = "Personal Telegram event digests using a ChatGPT subscription"
+requires-python = ">=3.12,<3.15"
 dependencies = [
   "aiogram>=3.31,<4",
   "aiosqlite>=0.21,<1",
-  "openai>=2,<3",
+  "httpx>=0.28,<1",
+  "truststore>=0.10,<1",
+  "PyJWT[crypto]>=2.10,<3",
   "pydantic-settings>=2.10,<3",
   "telethon>=1.45,<2",
   "tzdata>=2025.2",

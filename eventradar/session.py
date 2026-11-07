@@ -25,6 +25,7 @@ async def main() -> None:
         me = await client.get_me()
         if me.bot:
             raise RuntimeError("Use a user account, not a bot token")
+        print(f"Telegram reader user ID: {me.id}")
         # Exclusive creation prevents accidental replacement and follows restrictive umask.
         with destination.open("x") as output:
             output.write(client.session.save())

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, BotCommandScopeChat
 
 from eventradar.ai import Intelligence
 from eventradar.config import Settings
@@ -15,6 +15,7 @@ from eventradar.handlers import create_router
 from eventradar.reader import Reader
 from eventradar.routes import Routes
 from eventradar.service import Service
+from eventradar.runtime import instance_lock
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,18 @@ logger = logging.getLogger(__name__)
 async def main() -> None:
     os.umask(0o077)
     settings = Settings()
+    with instance_lock(settings.database_path):
+        await run(settings)
+
+
+async def run(settings: Settings) -> None:
     db = Database(settings.database_path)
     await db.initialize()
     ai = Intelligence(settings, db)
     bot = Bot(settings.telegram_bot_token.get_secret_value())
-    reader = Reader(settings, db, ai)
+    reader = Reader(settings, db)
     routes = Routes(ai, db)
-    service = Service(settings, db, ai, bot, routes)
+    service = Service(settings, db, ai, bot, routes, reader)
     dispatcher = Dispatcher()
     dispatcher.include_router(create_router(service, reader))
 
@@ -38,19 +44,10 @@ async def main() -> None:
             await asyncio.sleep(20)
 
     async def worker() -> None:
-        next_collection = 0.0
         next_reports = 0.0
         while True:
-            if time.monotonic() >= next_collection:
-                await reader.collect()
-                await reader.extract()
-                next_collection = time.monotonic() + settings.poll_interval_seconds
             if time.monotonic() >= next_reports:
-                # Rotating order prevents the same account from always being last at the AI limit.
-                users = await db.rows("SELECT id FROM users WHERE enabled=1 ORDER BY id")
-                if users:
-                    shift = datetime.now(UTC).date().toordinal() % len(users)
-                    users = users[shift:] + users[:shift]
+                users = await db.rows("SELECT id FROM users WHERE enabled=1 AND id=?", (settings.owner_telegram_id,))
                 for user in users:
                     try:
                         await service.digest(user["id"])
@@ -63,29 +60,27 @@ async def main() -> None:
                 next_reports = time.monotonic() + 60
             await asyncio.sleep(5)
 
-    async def notifications() -> None:
-        while True:
-            await service.deliver_outbox()
-            await asyncio.sleep(2)
-
     tasks: list[asyncio.Task] = []
     try:
         await reader.connect()
-        await bot.get_me()
+        identity = await bot.get_me()
+        service.bot_username = identity.username
+        await bot.delete_my_commands()
         await bot.set_my_commands([
             BotCommand(command="help", description="Все команды"),
             BotCommand(command="channels", description="Мои каналы"),
             BotCommand(command="digest", description="Мой дайджест"),
             BotCommand(command="prompt", description="Мои интересы"),
-            BotCommand(command="sharechannels", description="Поделиться каналами"),
-            BotCommand(command="friends", description="Мои друзья"),
+            BotCommand(command="ai", description="Подключение подписки ChatGPT"),
             BotCommand(command="history", description="Посещенные события"),
+            BotCommand(command="destination", description="Куда публиковать готовые отчеты"),
+            BotCommand(command="publish", description="Опубликовать готовый отчет без AI"),
             BotCommand(command="settings", description="Мои настройки"),
-        ])
+        ], scope=BotCommandScopeChat(chat_id=settings.owner_telegram_id))
         # Stale successful heartbeats must not make a newly starting process healthy.
         await db.execute("DELETE FROM metadata WHERE key='heartbeat'")
         tasks = [asyncio.create_task(coroutine) for coroutine in (
-            heartbeat(), worker(), notifications(),
+            heartbeat(), worker(),
             dispatcher.start_polling(bot, handle_as_tasks=True, close_bot_session=False),
         )]
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -98,7 +93,7 @@ async def main() -> None:
         await db.execute("DELETE FROM metadata WHERE key='heartbeat'")
         await reader.client.disconnect()
         await bot.session.close()
-        await ai.client.close()
+        await ai.client.aclose()
 
 
 if __name__ == "__main__":

@@ -21,13 +21,13 @@ class Routes:
             return ""
         destination = ", ".join(part for part in (item.city, item.venue) if part)
         # Home address is deliberately excluded from shareable map links.
-        link = "https://www.google.com/maps/dir/?" + urlencode({"api": 1, "destination": destination, "travelmode": "transit"})
-        result = "Карта места: " + link
+        link = "https://yandex.ru/maps/?" + urlencode({"text": destination})
+        result = "🗺 Яндекс Карты: " + link
         if not profile["routing"] or not profile["address"] or item.kind != "event" or item.cancelled:
             return result
         origin = ", ".join(part for part in (profile["region"], profile["city"], profile["address"]) if part)
         arrival_at = item.starts_at.isoformat() if item.starts_at else None
-        key = fingerprint("travel-v1", origin, destination, arrival_at, self.ai.settings.openai_model)
+        key = fingerprint("travel-v1", origin, destination, arrival_at, self.ai.model_key)
         try:
             cached = await self.db.one(
                 "SELECT payload FROM travel_estimates WHERE user_id=? AND fingerprint=? AND expires_at>?",
@@ -48,8 +48,8 @@ class Routes:
             return result + "\nНе удалось получить приблизительную оценку дороги."
         if estimate.min_minutes is None:
             return result + "\nAI не смог оценить дорогу по указанным адресам. " + estimate.explanation
-        parts = [result, f"Дорога на общественном транспорте: ориентировочно {estimate.min_minutes}–{estimate.max_minutes} мин."]
+        parts = [result, f"🚇 Дорога: ориентировочно {estimate.min_minutes}–{estimate.max_minutes} мин."]
         if estimate.min_transfers is not None:
-            parts.append(f"Пересадки: ориентировочно {estimate.min_transfers}–{estimate.max_transfers}.")
+            parts.append(f"🔄 Пересадки: ориентировочно {estimate.min_transfers}–{estimate.max_transfers}.")
         parts.extend([estimate.explanation, "Приблизительная оценка AI без карт, пробок и расписания транспорта; перед поездкой уточните маршрут."])
         return "\n".join(parts)

@@ -54,6 +54,20 @@ class Decision(BaseModel):
     reason: str = Field(max_length=450)
 
 
+class Recommendation(BaseModel):
+    item: Item
+    reason: str = Field(max_length=450)
+
+
+class AnalyzedPost(BaseModel):
+    post_id: int
+    recommendations: list[Recommendation] = Field(max_length=12)
+
+
+class BatchAnalysis(BaseModel):
+    publications: list[AnalyzedPost] = Field(max_length=20)
+
+
 class TravelEstimate(BaseModel):
     min_minutes: int | None = Field(ge=1, le=1440)
     max_minutes: int | None = Field(ge=1, le=1440)

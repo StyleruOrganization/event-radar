@@ -13,6 +13,7 @@ services:
     tmpfs: [/tmp:size=16m,mode=1777]
     volumes:
       - data:/data
+      - ./runtime/chatgpt:/data/chatgpt
     logging:
       driver: json-file
       options:

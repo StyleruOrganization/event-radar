@@ -72,6 +72,7 @@ async def run(settings: Settings) -> None:
                 BotCommand(command="add", description="Добавить публичный канал"),
                 BotCommand(command="remove", description="Удалить канал из моей подборки"),
                 BotCommand(command="channels", description="Мои каналы"),
+                BotCommand(command="prompt", description="Мои интересы для дайджеста"),
                 BotCommand(command="help", description="Доступные команды"),
             ],
             scope=BotCommandScopeAllPrivateChats(),

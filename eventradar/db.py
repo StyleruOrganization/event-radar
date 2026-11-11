@@ -5,6 +5,15 @@ from typing import AsyncIterator, Any
 
 import aiosqlite
 
+from eventradar.config import DEFAULT_PROMPT
+
+_PREVIOUS_DEFAULT_PROMPT = (
+    "Выбирай очные бизнес-события, встречи с предпринимателями и полезные лекции. "
+    "Требуются конкретные дата, время, место проведения и ссылка регистрации. "
+    "Отсеивай рекламу, итоги уже прошедших встреч, онлайн-события и анонсы без этих данных. "
+    "Кратко объясняй, чем мероприятие полезно."
+)
+
 
 def message_chunks(text: str, limit: int = 3800) -> list[str]:
     """Telegram counts UTF-16 code units. Prefer paragraph boundaries."""
@@ -64,6 +73,17 @@ class Database:
                 # Google consent does not authorize sending an address to a different provider.
                 await connection.execute("UPDATE users SET routing=0")
             await connection.executescript(files("eventradar").joinpath("schema.sql").read_text())
+
+        # Migrate the stored default once without changing the database schema version.
+        async with self.transaction() as connection:
+            async with connection.execute(
+                "INSERT OR IGNORE INTO metadata(key,value) VALUES('default_prompt_updated', '1')",
+            ) as migration:
+                if migration.rowcount == 1:
+                    await connection.execute(
+                        "UPDATE users SET prompt=? WHERE prompt=?",
+                        (DEFAULT_PROMPT, _PREVIOUS_DEFAULT_PROMPT),
+                    )
 
     async def rows(self, sql: str, parameters: tuple = ()) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path, timeout=30) as connection:

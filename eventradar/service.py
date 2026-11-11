@@ -14,7 +14,7 @@ from eventradar.ai import DailyBudgetExceeded, Intelligence, SubscriptionUnavail
 from eventradar.chatgpt_auth import AuthRequired
 from eventradar.config import DEFAULT_PROMPT, Settings
 from eventradar.db import Database, message_chunks
-from eventradar.domain import AnalyzedPost, Item, fingerprint, overlaps
+from eventradar.domain import AnalyzedPost, Item, fingerprint
 from eventradar.reader import Reader
 from eventradar.routes import Routes
 
@@ -53,8 +53,6 @@ class Service:
         if item.starts_at:
             local = item.starts_at.astimezone(ZoneInfo(profile["timezone"]))
             parts.append(f"🗓 Когда: {local:%d.%m.%Y %H:%M} ({profile['timezone']})")
-            if not item.ends_at:
-                parts.append("Время окончания не указано; для проверки занятости принято 2 часа.")
         if item.venue:
             parts.append("📍 Где: " + ", ".join(value for value in (item.city, item.venue) if value))
         if item.registration_url:
@@ -64,20 +62,16 @@ class Service:
         if reason:
             parts.append("✨ Почему подходит: " + reason)
         parts.append(f"🔗 Источник: https://t.me/{record['username']}/{record['message_id']}")
-        route = await self.routes.describe(profile, item)
+        route = await self.routes.describe({**profile, "routing": 0}, item)
         if route:
             parts.append(route)
         return "\n\n".join(parts)
 
-    def item_buttons(self, record: dict, shared: bool = False) -> InlineKeyboardMarkup:
-        item_id = record["id"]
+    def item_buttons(self, record: dict) -> InlineKeyboardMarkup:
         item = Item.model_validate_json(record["payload"])
         source = f"https://t.me/{record['username']}/{record['message_id']}"
         share = "https://t.me/share/url?" + urlencode({"url": source, "text": item.title})
         rows = [[InlineKeyboardButton(text="↗️ Поделиться постом", url=share)]]
-        if not shared:
-            rows.append([InlineKeyboardButton(text="✅ Я посетил(а)", callback_data=f"attend:{item_id}"),
-                         InlineKeyboardButton(text="💬 Мой отзыв", callback_data=f"reviews:{item_id}")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def send(self, user_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
@@ -108,7 +102,7 @@ class Service:
 
     async def send_card(self, chat_id: int, record: dict, profile: dict, photo_sources: set[tuple[str, int]], photo_budget: int, *, shared: bool = False) -> bool:
         text = await self.card(record, {**profile, "routing": 0} if shared else profile, record.get("reason", ""))
-        markup = self.item_buttons(record, shared=shared)
+        markup = self.item_buttons(record)
         source = (record["username"], record["message_id"])
         if photo_budget > 0 and source not in photo_sources:
             photo_sources.add(source)
@@ -268,7 +262,8 @@ class Service:
     async def digest(self, user_id: int, manual: bool = False) -> None:
         async with self.digest_lock:
             user = await self.db.one("SELECT * FROM users WHERE id=?", (user_id,))
-            if not user or user_id not in self.settings.users or (not manual and not user["enabled"]):
+            is_owner = user_id == self.settings.owner_telegram_id
+            if not user or (not manual and (not is_owner or not user["enabled"])):
                 return
             until = datetime.now(UTC).replace(microsecond=0)
             local = until.astimezone(ZoneInfo(user["timezone"]))
@@ -285,7 +280,7 @@ class Service:
                 await self.send(user_id, "С последнего отчета еще не начался новый период.")
                 return
             try:
-                failures = await self.reader.collect(since, until)
+                failures = await self.reader.collect(since, until, user_id=user_id)
                 if failures:
                     details = "\n".join(failures)
                     for chunk in message_chunks("Отчет пока не подготовлен: не удалось полностью прочитать каналы. Период не закрыт, AI-анализ не запускался.\n" + details + "\nПовтор: /digest или следующий запуск по расписанию."):
@@ -298,7 +293,6 @@ class Service:
                     (user_id, since.isoformat(), until.isoformat()),
                 )
                 records = await self.analyze(posts, user)
-                rules = await self.db.rows("SELECT * FROM blackouts WHERE user_id=?", (user_id,))
                 seen: set[str] = set()
                 sent, photos = 0, 0
                 photo_sources: set[tuple[str, int]] = set()
@@ -307,7 +301,7 @@ class Service:
                     item = Item.model_validate_json(record["payload"])
                     if user["prompt"] == DEFAULT_PROMPT and (item.kind != "event" or not item.starts_at or not item.venue or not item.registration_url):
                         continue
-                    if item.cancelled or (item.starts_at and item.starts_at <= until) or overlaps(item, rules, user["timezone"]):
+                    if item.cancelled or (item.starts_at and item.starts_at <= until):
                         continue
                     event_key = fingerprint(item.title.casefold().strip(), str(item.starts_at), (item.venue or "").casefold())
                     if event_key in seen:
@@ -341,7 +335,7 @@ class Service:
                         await connection.execute("UPDATE users SET last_report_at=? WHERE id=?", (until.isoformat(), user_id))
                     else:
                         await connection.execute("UPDATE users SET last_report_at=?,last_report=? WHERE id=?", (until.isoformat(), day, user_id))
-                if await self.destination():
+                if is_owner and await self.destination():
                     try:
                         await self.publish_latest()
                     except Exception as error:

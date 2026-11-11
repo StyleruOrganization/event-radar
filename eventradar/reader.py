@@ -89,14 +89,14 @@ class Reader:
             (channel_id, message.id, message.date.astimezone(UTC).isoformat(), text, fingerprint(text)),
         )
 
-    async def collect(self, since: datetime, until: datetime) -> list[str]:
+    async def collect(self, since: datetime, until: datetime, *, user_id: int) -> list[str]:
         """Load the complete report window. This method never calls AI."""
         if time.time() < self.cooldown_until:
             return ["Telegram просит подождать перед повторным чтением каналов."]
         failures: list[str] = []
         channels = await self.db.rows(
             "SELECT c.* FROM channels c JOIN subscriptions s ON s.channel_id=c.id WHERE s.user_id=? ORDER BY c.id",
-            (self.settings.owner_telegram_id,),
+            (user_id,),
         )
         for channel in channels:
             try:

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import BotCommand, BotCommandScopeChat
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 
 from eventradar.ai import Intelligence
 from eventradar.config import Settings
@@ -66,13 +66,22 @@ async def run(settings: Settings) -> None:
         identity = await bot.get_me()
         service.bot_username = identity.username
         await bot.delete_my_commands()
+        await bot.set_my_commands(
+            [
+                BotCommand(command="didgest", description="Дайджест по моим каналам"),
+                BotCommand(command="add", description="Добавить публичный канал"),
+                BotCommand(command="remove", description="Удалить канал из моей подборки"),
+                BotCommand(command="channels", description="Мои каналы"),
+                BotCommand(command="help", description="Доступные команды"),
+            ],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
         await bot.set_my_commands([
             BotCommand(command="help", description="Все команды"),
             BotCommand(command="channels", description="Мои каналы"),
             BotCommand(command="digest", description="Мой дайджест"),
             BotCommand(command="prompt", description="Мои интересы"),
             BotCommand(command="ai", description="Подключение подписки ChatGPT"),
-            BotCommand(command="history", description="Посещенные события"),
             BotCommand(command="destination", description="Куда публиковать готовые отчеты"),
             BotCommand(command="publish", description="Опубликовать готовый отчет без AI"),
             BotCommand(command="settings", description="Мои настройки"),

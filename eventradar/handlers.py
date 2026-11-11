@@ -34,6 +34,7 @@ PUBLIC_HELP = """EventRadar — подборка событий из ваших 
 /prompt reset — вернуть стандартный текст
 /channels — посмотреть добавленные каналы
 /remove @канал — убрать канал из подборки
+/didgest reset — заново получить дайджест за последние 7 дней, включая карточки, которые вы уже получали
 
 Дайджест можно запросить раз в 5 минут. Подписка внутри бота не меняет ваши личные подписки Telegram.
 """
@@ -223,8 +224,12 @@ def create_router(service: Service, reader: Reader) -> Router:
                     await message.answer("Повторный дайджест доступен через 5 минут после предыдущего запроса.")
                     return
                 await db.execute("UPDATE users SET last_manual=? WHERE id=?", (time.time(), uid))
-                await message.answer("Подбираю публикации. Обработка может занять несколько минут.")
-                await service.digest(uid, manual=True)
+                reset_period = argument == "reset"
+                if reset_period:
+                    await message.answer("Подбираю публикации за последние 7 дней. Обработка может занять несколько минут.")
+                else:
+                    await message.answer("Подбираю публикации. Обработка может занять несколько минут.")
+                await service.digest(uid, manual=True, reset_period=reset_period)
             elif name in {"/pause", "/resume"}:
                 await db.execute("UPDATE users SET enabled=? WHERE id=?", (int(name == "/resume"), uid))
                 await message.answer("Отчеты включены." if name == "/resume" else "Отчеты выключены. Включить снова: /resume.")

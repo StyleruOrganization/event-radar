@@ -259,7 +259,7 @@ class Service:
                 await connection.execute("UPDATE posts SET processed_hash=content_hash WHERE id=?", (post["id"],))
         return records
 
-    async def digest(self, user_id: int, manual: bool = False) -> None:
+    async def digest(self, user_id: int, manual: bool = False, *, reset_period: bool = False) -> None:
         async with self.digest_lock:
             user = await self.db.one("SELECT * FROM users WHERE id=?", (user_id,))
             is_owner = user_id == self.settings.owner_telegram_id
@@ -275,15 +275,26 @@ class Service:
             if not manual:
                 # Failed scheduled reports must not turn into an AI retry loop every minute.
                 await self.db.execute("UPDATE users SET last_report_attempt=? WHERE id=?", (day, user_id))
-            since = datetime.fromisoformat(user["last_report_at"]) if user["last_report_at"] else until - timedelta(days=self.settings.initial_lookback_days)
+            if reset_period:
+                since = until - timedelta(days=7)
+            elif user["last_report_at"]:
+                since = datetime.fromisoformat(user["last_report_at"])
+            else:
+                since = until - timedelta(days=self.settings.initial_lookback_days)
             if since >= until:
                 await self.send(user_id, "С последнего отчета еще не начался новый период.")
                 return
+            retry_message = "Повторите /didgest reset позже." if reset_period else (
+                "Повторите /digest позже или дождитесь следующего времени отчета."
+            )
             try:
                 failures = await self.reader.collect(since, until, user_id=user_id)
                 if failures:
                     details = "\n".join(failures)
-                    for chunk in message_chunks("Отчет пока не подготовлен: не удалось полностью прочитать каналы. Период не закрыт, AI-анализ не запускался.\n" + details + "\nПовтор: /digest или следующий запуск по расписанию."):
+                    for chunk in message_chunks(
+                        "Отчет пока не подготовлен: не удалось полностью прочитать каналы. "
+                        f"Период не закрыт, AI-анализ не запускался.\n{details}\n{retry_message}"
+                    ):
                         await self.send(user_id, chunk)
                     return
                 posts = await self.db.rows(
@@ -309,9 +320,13 @@ class Service:
                     seen.add(event_key)
                     snapshot_cards.append(record)
                     payload_hash = fingerprint(record["payload"])
-                    delivered = await self.db.one("SELECT fingerprint FROM deliveries WHERE user_id=? AND item_id=?", (user_id, record["id"]))
-                    if delivered and delivered["fingerprint"] == payload_hash:
-                        continue
+                    if not reset_period:
+                        delivered = await self.db.one(
+                            "SELECT fingerprint FROM deliveries WHERE user_id=? AND item_id=?",
+                            (user_id, record["id"]),
+                        )
+                        if delivered and delivered["fingerprint"] == payload_hash:
+                            continue
                     photos += int(await self.send_card(user_id, record, user, photo_sources, max(0, self.settings.max_photos_per_report - photos)))
                     await self.db.execute(
                         "INSERT INTO deliveries(user_id,item_id,fingerprint,sent_at) VALUES(?,?,?,?) "
@@ -320,7 +335,12 @@ class Service:
                     )
                     sent += 1
                 start_local = since.astimezone(ZoneInfo(user["timezone"]))
-                summary = f"📬 Отчет за {start_local:%d.%m %H:%M} — {local:%d.%m %H:%M} ({user['timezone']})\n📚 Публикаций: {len(posts)}\n🎯 Подходящих карточек: {len(snapshot_cards)}\n📨 Новых отправлено: {sent}"
+                sent_label = "Карточек отправлено" if reset_period else "Новых отправлено"
+                summary = (
+                    f"📬 Отчет за {start_local:%d.%m %H:%M} — {local:%d.%m %H:%M} ({user['timezone']})\n"
+                    f"📚 Публикаций: {len(posts)}\n🎯 Подходящих карточек: {len(snapshot_cards)}\n"
+                    f"📨 {sent_label}: {sent}"
+                )
                 if not records:
                     summary += " Подходящих публикаций не найдено."
                 # Only a fully delivered report advances the time boundary. Messages arriving during
@@ -335,14 +355,21 @@ class Service:
                         await connection.execute("UPDATE users SET last_report_at=? WHERE id=?", (until.isoformat(), user_id))
                     else:
                         await connection.execute("UPDATE users SET last_report_at=?,last_report=? WHERE id=?", (until.isoformat(), day, user_id))
-                if is_owner and await self.destination():
+                if is_owner and not reset_period and await self.destination():
                     try:
                         await self.publish_latest()
                     except Exception as error:
                         logger.warning("Shared publication failed (%s)", type(error).__name__)
                         await self.send(user_id, "Личный отчет завершен, но общая публикация прервалась. Проверьте доступ бота и повторите /publish; AI повторно не вызывается.")
             except (DailyBudgetExceeded, SubscriptionUnavailable, AuthRequired) as error:
-                await self.send(user_id, str(error) + "\nОтчет не завершен; период сохранен. Готовые результаты кешируются. Повторите /digest позже или дождитесь следующего времени отчета.")
+                await self.send(
+                    user_id,
+                    f"{error}\nОтчет не завершен. Период сохранен. Готовые результаты кешируются. {retry_message}",
+                )
             except Exception:
                 logger.exception("Report preparation failed", exc_info=False)
-                await self.send(user_id, "Не удалось завершить отчет. Период не закрыт; уже отправленные карточки и обработанные публикации сохранены. Повторите /digest позже или дождитесь следующего времени отчета.")
+                await self.send(
+                    user_id,
+                    "Не удалось завершить отчет. Период не закрыт. "
+                    f"Уже отправленные карточки и обработанные публикации сохранены. {retry_message}",
+                )

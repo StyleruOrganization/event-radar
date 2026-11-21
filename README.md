@@ -1,6 +1,6 @@
 # EventRadar — личный бот
 
-Пошаговый первый деплой на сервер Termeet: [infra/DEPLOY.md](infra/DEPLOY.md). Инструкция включает ключи SSH, GitHub Secrets, перенос локальной базы и ChatGPT-сессии.
+Деплой через общую инфраструктуру Termeet и перенос данных: [infra/DEPLOY.md](infra/DEPLOY.md). Инструкция включает SOPS-секреты проекта, перенос SQLite и вход в новый аккаунт ChatGPT.
 
 Настройки и AI-команды бота доступны только владельцу, указанному в `OWNER_TELEGRAM_ID`, в личном чате. Готовые отчеты можно дополнительно публиковать в выбранную приватную группу или канал. Читает публичные Telegram-каналы, выбирает события по вашим интересам и присылает дайджест. AI работает через подписку ChatGPT Pro с официальной авторизацией Sign in with ChatGPT. `OPENAI_API_KEY`, API-организация и отдельный API-баланс для этого режима не используются. Автоматического переключения на платный API нет.
 
@@ -97,80 +97,16 @@ python -m eventradar.session
 
 `ALLOWED_USER_IDS`, `OPENAI_API_KEY`, `OPENAI_MODEL`, `GOOGLE_ROUTES_API_KEY`, `POLL_INTERVAL_SECONDS`, `MAX_POSTS_PER_CYCLE` и `MAX_DIGEST_ITEMS` больше не используются. OAuth-токены не кладите в `BOT_ENV`: сервер обновляет их во время работы, а старое значение из GitHub при деплое могло бы затереть обновленную сессию.
 
-## Перенос сессии на сервер
+## Деплой и переезд на новый сервер
 
-На сервере сессия лежит в `/srv/eventradar/runtime/chatgpt`, который монтируется в `/data/chatgpt`. SQLite и резервные копии остаются на отдельном Docker volume. Каталог `runtime/` исключен из Git и Docker build context.
+Репозиторий приложения — `https://github.com/StyleruOrganization/event-radar.git`.
+Релизы выполняются вручную из `StyleruOrganization/infra` через workflow
+`Release service` с `project=event-radar`, `service=bot` и выбранным `ref`.
+Сервер получает исходники, собирает образ и делает согласованный SQLite-бэкап.
+Стратегия `recreate` останавливает предыдущую версию перед запуском новой.
 
-Сначала подготовьте пользователя и код, затем соберите первый образ вручную или по отдельно согласованному запуску. До включения автоматического деплоя импортируйте сессию. Команды администратора сервера:
-
-```bash
-sudo install -d -m 700 -o 10001 -g 10001 /srv/eventradar/runtime/chatgpt
-cd /srv/eventradar
-docker compose build bot
-```
-
-Из терминала вашего компьютера, где выполнен вход, передайте файл через SSH stdin. Замените `your-server` на IP/DNS машины; для нестандартного SSH-порта добавьте `-p`:
-
-```bash
-ssh eventradar@your-server 'cd /srv/eventradar && docker compose run --rm --no-deps -T bot python -m eventradar.chatgpt_auth --directory /data/chatgpt import-session' < data/chatgpt/credentials.json
-```
-
-Импорт проверяет подпись и актуальность ID token, поэтому передавайте сессию сразу после свежего login. Он сохраняет собственный host ID сервера и не копирует идентификатор ноутбука. Действующая сессия не перезаписывается. После импорта токены обновляет только сервер: не запускайте с той же копией локальный бот или команды, обновляющие токены. Для локальной работы нужна отдельная OAuth-сессия в другом каталоге.
-
-На сервере `/srv/eventradar/.env` должен существовать уже для первоначальной сборки/импорта, даже если далее он управляется через `BOT_ENV`. Все обязательные Telegram-переменные должны быть заполнены перед запуском самого бота.
-
-Теперь можно включить `DEPLOY_ENABLED=true` и запустить workflow. Для ручного первого старта после настройки:
-
-```bash
-cd /srv/eventradar
-docker compose up -d --no-build
-```
-
-При повторной авторизации остановите бот, выполните logout в контейнере и импортируйте свежую сессию. Не храните OAuth-файлы в issue, чате, логах, backup-копиях приложения или GitHub Secrets. Потеря или отзыв сессии требует нового входа; скрытого платного fallback нет.
-
-## SSH и GitHub Actions
-
-Схема сохраняется: GitHub Actions подключается к серверу, сервер получает код из Git и собирает образ локально. Registry не используется.
-
-На Ubuntu/Debian создайте отдельного пользователя и каталог:
-
-```bash
-sudo adduser --disabled-password --gecos '' eventradar
-sudo install -d -m 700 -o eventradar -g eventradar /home/eventradar/.ssh
-sudo install -d -m 750 -o eventradar -g eventradar /srv/eventradar
-sudo usermod -aG docker eventradar
-```
-
-Docker Engine, Compose plugin и Git должны быть установлены. Группа `docker` дает фактические полномочия root; используйте доверенный сервер. После изменения группы нужен новый SSH-сеанс.
-
-| Соединение | Приватный ключ | Публичный ключ |
-| --- | --- | --- |
-| Actions → сервер | GitHub Secret `SSH_PRIVATE_KEY` | `/home/eventradar/.ssh/authorized_keys` |
-| Сервер → GitHub | `/home/eventradar/.ssh/github_eventradar` | Settings → Deploy keys репозитория, только чтение |
-
-Отдельную пару Actions можно создать на компьютере командой `ssh-keygen -t ed25519 -f ~/.ssh/eventradar_actions -C eventradar-actions -N ''`. Добавьте `.pub` одной строкой в `authorized_keys`, сохранив существующие ключи. Файл должен принадлежать `eventradar`, права `600`, каталог `.ssh` — `700`. Приватный ключ целиком сохраните в GitHub Secret; на сервер его копировать не нужно.
-
-На сервере создайте другую пару командой `sudo -u eventradar ssh-keygen -t ed25519 -f /home/eventradar/.ssh/github_eventradar -C eventradar-readonly -N ''`. Публичную часть добавьте в Deploy keys без Allow write access. В `/home/eventradar/.ssh/config` укажите IdentityFile этого ключа для github.com, `IdentitiesOnly yes`, `StrictHostKeyChecking yes`. Добавьте проверенный host key GitHub в known_hosts, сверив его с [официальными fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
-
-Клонирование:
-
-```bash
-sudo -u eventradar git clone git@github.com:Kiryshka1922/eventradar.git /srv/eventradar
-```
-
-В GitHub environment `production` задайте:
-
-| Secret | Значение |
-| --- | --- |
-| `SSH_HOST` | IP/DNS сервера без схемы и порта |
-| `SSH_USER` | `eventradar` |
-| `SSH_PRIVATE_KEY` | Приватный ключ Actions → сервер |
-| `SSH_KNOWN_HOSTS` | Проверенный публичный host key вашего SSH-сервера |
-| `BOT_ENV` | Заполненный dotenv-файл, без OAuth-токенов |
-
-`SSH_KNOWN_HOSTS` — строка `your-server ssh-ed25519 AAAA...`, для нестандартного порта — `[your-server]:2222 ssh-ed25519 AAAA...`. Публичный ключ берется через доверенную консоль из `/etc/ssh/ssh_host_ed25519_key.pub`; приватный host key никуда не переносится.
-
-Repository Variables: `SSH_PORT=22` и `DEPLOY_ENABLED=true` после импорта ChatGPT-сессии. Workflow откажется выкатывать релиз без файла сессии. Он получает точный SHA из main, строит образ до остановки старого контейнера, делает online SQLite backup и ожидает healthcheck. Сохраняются последние 10 резервных копий; старые образы автоматически не удаляются. При несовместимой миграции откат приложения может потребовать ручного восстановления базы.
+Подготовка SOPS-секретов, перенос базы, смена аккаунта ChatGPT и первый релиз
+описаны в [infra/DEPLOY.md](infra/DEPLOY.md).
 
 ## Команды
 
@@ -214,27 +150,11 @@ HTTPX использует системное хранилище сертифи�
 
 Ручной отчет тоже закрывает успешно обработанный период. Следующий отчет по расписанию берет только новые сообщения после него. Изменение промпта применяется к новому/еще не закрытому периоду, не пересматривает автоматически всю старую историю. При обновлении старой базы граница по возможности восстанавливается из времени последней доставленной карточки; если истории доставки нет, используется первичная глубина.
 
-## Как сохранить локальные каналы при первом деплое
+## Первый запуск на новом сервере
 
-Локальная и серверная базы физически разные. При первом запуске без переноса сервер создаст пустую базу. Последующие деплои базу не очищают: она хранится в постоянном Docker volume `data`, а не в образе или Git. Поэтому каналы, промпт и расписание имеет смысл настроить локально и затем перенести. Не выполняйте `docker compose down -v`, если данные нужно сохранить.
-
-Подготовьте согласованный снимок локальной базы (SQLite backup API корректно учитывает WAL; копировать только основной файл работающей базы через cp нельзя):
-
-```bash
-cd /Users/kipabelousov/eventradar
-source .venv312-uv/bin/activate
-python -m eventradar.storage backup --output data/eventradar-transfer.sqlite3
-```
-
-Экспорт включает настройки, каналы, промпт, занятость, историю, результаты анализа и границу последнего отчета. Он не содержит `.env`, токен Telegram и OAuth-файлы ChatGPT. В базе остаются личные данные вроде адреса и отзывов; снимок имеет закрытые права и передается по SSH.
-
-До первого запуска самого бота на сервере, после настройки кода, `.env`, Docker и ChatGPT-сессии, выполните с компьютера:
-
-```bash
-ssh eventradar@your-server 'cd /srv/eventradar && docker compose run --rm --no-deps -T bot python -m eventradar.storage restore --stdin' < data/eventradar-transfer.sqlite3
-```
-
-Команда проверяет структуру и целостность снимка и откажется перезаписывать уже существующую серверную базу. Если на сервере уже есть база, сначала определите, какие данные сохранять; автоматического слияния или удаления нет. Для импорта в другой файл предусмотрен `--database /data/новое-имя.sqlite3` перед `restore`, после чего нужно согласованно изменить `DATABASE_PATH`. Один файл базы одновременно обслуживает только один процесс бота.
+При первом запуске EventRadar создаёт пустую базу. Добавьте каналы и задайте
+свой промпт заново. Перед первым релизом остановите старый экземпляр бота.
+Порядок подготовки описан в [infra/DEPLOY.md](infra/DEPLOY.md).
 
 ## Оформление, Яндекс Карты и иллюстрации
 

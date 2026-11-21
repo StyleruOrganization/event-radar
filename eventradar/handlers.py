@@ -21,7 +21,10 @@ PUBLIC_HELP = """EventRadar — подборка событий из ваших 
 
 Вы сами решаете, что попадёт в дайджест. Напишите боту обычными словами, какие события вам интересны. Этот текст называется промптом. У каждого пользователя свой промпт.
 
-1. Добавьте публичный канал. Отправьте /add и через пробел напишите @имя_канала.
+1. Добавьте один или несколько публичных каналов. Напишите их через пробел в одном сообщении:
+
+/add @channel1 @channel2 https://t.me/channel3
+
 2. Напишите /prompt и через пробел опишите, что хотите найти. Например, отправьте такое сообщение.
 
 /prompt Показывай бесплатные выставки и экскурсии в Москве на выходных
@@ -110,6 +113,90 @@ def create_router(service: Service, reader: Reader) -> Router:
     router.message.outer_middleware(access)
     router.callback_query.outer_middleware(access)
 
+    async def add_channels(message: Message, argument: str, uid: int, is_owner: bool) -> None:
+        candidates = argument.split()
+        if not candidates:
+            await message.answer(
+                "Укажите один или несколько публичных каналов через пробел. Например:\n"
+                "/add @channel1 @channel2 https://t.me/channel3"
+            )
+            return
+
+        subscriptions = await db.rows(
+            "SELECT c.id,c.username FROM channels c "
+            "JOIN subscriptions s ON s.channel_id=c.id WHERE s.user_id=?",
+            (uid,),
+        )
+        subscribed_ids = {channel["id"] for channel in subscriptions}
+        subscribed_usernames = {channel["username"].lower() for channel in subscriptions}
+        seen: set[str] = set()
+        results: list[str] = []
+        added = 0
+        flood_wait: int | None = None
+
+        for candidate in candidates:
+            try:
+                username = channel_username(candidate)
+            except ValueError:
+                results.append(f"{candidate} — неверный формат. Нужен @username или https://t.me/username без ссылки на пост.")
+                continue
+            if username in seen:
+                continue
+            seen.add(username)
+            if username in subscribed_usernames:
+                results.append(f"@{username} — уже в вашей подборке.")
+                continue
+            if len(subscribed_ids) >= service.settings.max_channels_per_user:
+                results.append(f"@{username} — не добавлен: достигнут лимит каналов. Удалите ненужный через /remove.")
+                continue
+            if flood_wait is not None:
+                results.append(f"@{username} — не обработан: Telegram запросил паузу.")
+                continue
+            try:
+                channel_id, title = await reader.resolve(username)
+            except FloodWaitError as error:
+                flood_wait = error.seconds
+                results.append(f"@{username} — не обработан: Telegram запросил паузу.")
+                continue
+            except Exception:
+                results.append(f"@{username} — не удалось открыть. Проверьте, что это публичный канал и ссылка верна.")
+                continue
+            if channel_id in subscribed_ids:
+                subscribed_usernames.add(username)
+                results.append(f"@{username} — уже в вашей подборке.")
+                continue
+
+            async with db.transaction() as connection:
+                await connection.execute(
+                    "INSERT INTO channels(id,username,title) VALUES(?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET username=excluded.username,title=excluded.title WHERE ?",
+                    (channel_id, username, title, is_owner),
+                )
+                await connection.execute(
+                    "INSERT OR IGNORE INTO subscriptions(user_id,channel_id) VALUES(?,?)",
+                    (uid, channel_id),
+                )
+                async with connection.execute("SELECT username FROM channels WHERE id=?", (channel_id,)) as cursor:
+                    channel = await cursor.fetchone()
+            subscribed_ids.add(channel_id)
+            subscribed_usernames.update((username, channel["username"].lower()))
+            added += 1
+            results.append(f"Добавлен @{channel['username']}.")
+
+        if flood_wait is not None:
+            results.append(
+                f"\nTelegram просит подождать {flood_wait} с. "
+                "После паузы повторите /add для необработанных каналов. Уже добавленные сохранены."
+            )
+        if added:
+            report_command = "при подготовке ближайшего отчета или по /digest" if is_owner else "по /didgest"
+            results.append(
+                f"\nСообщения будут прочитаны и проанализированы {report_command}. "
+                f"Для самого первого отчета берется история за {service.settings.initial_lookback_days} дней."
+            )
+        for chunk in message_chunks("\n".join(results)):
+            await message.answer(chunk)
+
     @router.message()
     async def command(message: Message) -> None:
         if not message.text:
@@ -157,38 +244,12 @@ def create_router(service: Service, reader: Reader) -> Router:
                     await message.answer("Карточка недоступна или обновлена.")
                     return
                 await service.send_card(uid,record,{**user,"routing":0},set(),service.settings.max_photos_per_report)
-            elif name in {"/add", "/remove"}:
+            elif name == "/add":
+                await add_channels(message, argument, uid, is_owner)
+            elif name == "/remove":
                 username = channel_username(argument)
-                if name == "/remove":
-                    await db.execute("DELETE FROM subscriptions WHERE user_id=? AND channel_id IN (SELECT id FROM channels WHERE username=?)", (uid, username))
-                    await message.answer(f"Подписка на @{username} удалена.")
-                    return
-                count = await db.one("SELECT COUNT(*) AS n FROM subscriptions WHERE user_id=?", (uid,))
-                if count["n"] >= service.settings.max_channels_per_user:
-                    await message.answer("Достигнут лимит каналов. Удалите ненужный через /remove.")
-                    return
-                try:
-                    channel_id, title = await reader.resolve(username)
-                except FloodWaitError as error:
-                    await message.answer(f"Telegram просит подождать {error.seconds} с. Повторите позже.")
-                    return
-                except Exception:
-                    await message.answer("Не удалось открыть канал. Проверьте, что он публичный и ссылка верна.")
-                    return
-                async with db.transaction() as connection:
-                    await connection.execute(
-                        "INSERT INTO channels(id,username,title) VALUES(?,?,?) "
-                        "ON CONFLICT(id) DO UPDATE SET username=excluded.username,title=excluded.title WHERE ?",
-                        (channel_id, username, title, is_owner),
-                    )
-                    await connection.execute("INSERT OR IGNORE INTO subscriptions(user_id,channel_id) VALUES(?,?)", (uid, channel_id))
-                    async with connection.execute("SELECT username FROM channels WHERE id=?", (channel_id,)) as cursor:
-                        channel = await cursor.fetchone()
-                report_command = "при подготовке ближайшего отчета или по /digest" if is_owner else "по /didgest"
-                await message.answer(
-                    f"Добавлен @{channel['username']}. Сообщения будут прочитаны и проанализированы {report_command}. "
-                    f"Для самого первого отчета берется история за {service.settings.initial_lookback_days} дней."
-                )
+                await db.execute("DELETE FROM subscriptions WHERE user_id=? AND channel_id IN (SELECT id FROM channels WHERE username=?)", (uid, username))
+                await message.answer(f"Подписка на @{username} удалена.")
             elif name == "/channels":
                 rows = await db.rows("SELECT c.* FROM channels c JOIN subscriptions s ON s.channel_id=c.id WHERE s.user_id=? ORDER BY c.title", (uid,))
                 text = "\n".join(f"@{r['username']} — {r['title']}" + (f" · {r['error']}" if r["error"] else "") for r in rows) or "Каналов пока нет. Добавьте /add @channel."
